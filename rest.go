@@ -38,11 +38,11 @@ type RestCtx struct {
 }
 
 func jsonResp(status int, payload any, extra map[string]string) Response {
-	return Response{Status: status, ContentType: "application/json; charset=utf-8", Body: marshalJSONLine(payload), Extra: extra}
+	return Response{Status: status, ContentType: "application/json", Body: marshalJSONLine(payload), Extra: extra}
 }
 
 func rawJSONResp(status int, text string, extra map[string]string) Response {
-	return Response{Status: status, ContentType: "application/json; charset=utf-8", Body: []byte(text), Extra: extra}
+	return Response{Status: status, ContentType: "application/json", Body: []byte(text), Extra: extra}
 }
 
 func errResp(status int, message string) Response {
