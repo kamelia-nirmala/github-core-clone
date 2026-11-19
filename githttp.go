@@ -13,11 +13,11 @@ type ProtocolError struct{ msg string }
 func (e *ProtocolError) Error() string { return e.msg }
 
 func uploadV0Caps(branch string) string {
-	return "multi_ack thin-pack side-band-64k side-band ofs-delta shallow no-progress agent=forge/1.0 symref=HEAD:refs/heads/" + branch
+	return "multi_ack thin-pack side-band-64k side-band ofs-delta shallow no-progress symref=HEAD:refs/heads/" + branch
 }
 
 func receiveV0Caps(branch string) string {
-	return "report-status side-band-64k delete-refs ofs-delta agent=forge/1.0 symref=HEAD:refs/heads/" + branch
+	return "report-status side-band-64k delete-refs symref=HEAD:refs/heads/" + branch
 }
 
 // Route one git smart-HTTP request. Always handled for a .git path.
@@ -131,12 +131,8 @@ func advertisementV2() []byte {
 	out = append(out, PktLineFlush()...)
 	out = append(out, EncodePktLines([]string{
 		"version 2\n",
-		"ls-refs=unborn\n",
-		"fetch=shallow filter\n",
-		"object-format=sha1\n",
-		"agent=forge/1.0\n",
-		"object-info\n",
-		"server-option\n",
+		"ls-refs\n",
+		"fetch=shallow\n",
 	})...)
 	out = append(out, PktLineFlush()...)
 	return out
