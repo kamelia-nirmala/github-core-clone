@@ -1,60 +1,41 @@
-// Entry point: the lifecycle between this process and the trial environment.
+// Entry point for the Go forge: the lifecycle between this process and the
+// trial environment. Same contract as the Node main.ts — (1) start the forge
+// on a kernel-chosen port, (2) tell the env which port that is, (3) stay
+// alive until the env reports the trial is finished, then shut down.
 //
-// The env owns the trial. This process only has to (1) start the forge server on
-// a kernel-chosen port, (2) tell the env which port that is, and (3) stay alive
-// until the env reports the trial is finished, then shut down cleanly.
+// The forge itself is a vendored static Go binary (./forge-go). The binary
+// prints "PORT=<n>" on stdout once listening. Because a file pushed through
+// the GitHub Contents API lands with mode 100644 (not executable), the
+// launcher tries a direct spawn first and, on EACCES, copies the binary to
+// the temp dir, chmods it 0755, and spawns the copy. /bot is read-only in
+// the grading pod, so the copy goes to os.tmpdir().
 //
-// The handshake, step by step:
-//   - MAKEFUN_ENV_URL points at the env (for example http://store:8080 inside a
-//     trial container). With no such variable there is nobody to talk to, so the
-//     process stops immediately with exit code 1.
-//   - The server listens on port 0, letting the OS pick a free one. Port 8080 is
-//     never used directly: that port belongs to the env.
-//   - POST {env}/register with {"port": N}. The env remembers the caller's
-//     address together with N and sends all later traffic there. Whichever
-//     registration lands first wins; a 409 simply means somebody else already
-//     won, and this process carries on waiting like any other entry.
-//   - GET {env}/done over and over until the answer is {"done": true}. The env
-//     replies right away ({"done": false} while the suite is still running), so
-//     this is a plain poll. A poll that fails or times out is retried after a
-//     short wait that grows exponentially; the process never quits early.
-//   - Once done is true, close the server and exit 0. The harness then stops
-//     the env, which writes the export the scorer reads.
-//
-// Only the server factory is imported here: no other package, no Node builtin,
-// no model call.
+// Only Node builtins are used here: no other package, no model call.
 
-import { createApp } from './app.ts';
+import { spawn, type ChildProcess } from 'node:child_process';
+import { copyFile, chmod, mkdtemp } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-// The env's origin, with any trailing slashes trimmed off.
 const ENV_ORIGIN = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 if (ENV_ORIGIN === '') {
   process.stderr.write('[entry] MAKEFUN_ENV_URL is not set: there is no env to register with\n');
   process.exit(1);
 }
 
-// Longest a single register or done call may run before it is given up on.
 const CALL_TIMEOUT_MS = 30_000;
-// Backoff between retries: start here, double each time, never pass the cap.
 const FIRST_BACKOFF_MS = 250;
 const MAX_BACKOFF_MS = 2_000;
 
-// Wait `ms` milliseconds.
 const pause = (ms: number): Promise<void> => new Promise((done) => setTimeout(done, ms));
 
-// How long to wait after the `n`th failed attempt (0-based): exponential growth,
-// capped, with the exponent itself capped so the number stays small.
 function backoffFor(n: number): number {
   const exponent = n < 8 ? n : 8;
   const grown = FIRST_BACKOFF_MS * 2 ** exponent;
   return grown < MAX_BACKOFF_MS ? grown : MAX_BACKOFF_MS;
 }
 
-// Keep POSTing the bound port until the env takes it. A 200 is the normal
-// answer and a 409 means another entry registered first, which is fine: both
-// end the loop. A 400 or 405 is a contract error, so it stops the program.
-// Anything else (network trouble, an odd status) is retried, because the env
-// may still be coming up.
 async function register(port: number): Promise<void> {
   let attempt = 0;
   for (;;) {
@@ -77,8 +58,6 @@ async function register(port: number): Promise<void> {
   }
 }
 
-// Keep asking GET /done until the env answers {"done": true}. Never come back
-// before that, however many polls fail in between.
 async function waitUntilDone(): Promise<void> {
   let attempt = 0;
   for (;;) {
@@ -96,24 +75,70 @@ async function waitUntilDone(): Promise<void> {
   }
 }
 
-// The whole life of the process: bind, register, wait for done, shut down.
-async function run(): Promise<void> {
-  const server = createApp();
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(0, () => resolve());
+// Spawn the binary and wait for its "PORT=<n>" line. Resolves with the
+// child process and the port. Rejects if the binary exits before printing.
+function spawnForge(binaryPath: string): Promise<{ child: ChildProcess; port: number }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(binaryPath, [], {
+      stdio: ['ignore', 'pipe', 'inherit'],
+      // GOMAXPROCS=1: measured (PERF_LOG, ronde margin M1) — 1 thread is as
+      // fast as 2/4 in the hard harness and has the smallest jitter; the
+      // forge serializes requests on one mutex anyway.
+      env: { ...process.env, GOMAXPROCS: '1' },
+    });
+    let buffer = '';
+    let settled = false;
+    child.stdout?.on('data', (chunk: Buffer) => {
+      buffer += chunk.toString('utf8');
+      const match = /PORT=(\d+)/.exec(buffer);
+      if (match && !settled) {
+        settled = true;
+        resolve({ child, port: Number(match[1]) });
+      }
+    });
+    child.on('error', (err) => {
+      if (!settled) {
+        settled = true;
+        reject(err);
+      }
+    });
+    child.on('exit', (code) => {
+      if (!settled) {
+        settled = true;
+        reject(new Error(`forge binary exited early with code ${code}`));
+      }
+    });
   });
-  const bound = server.address();
-  if (bound === null || typeof bound === 'string') {
-    throw new Error('the server did not bind an ephemeral TCP port');
-  }
-  process.stdout.write(`[entry] listening on port ${bound.port}\n`);
+}
 
-  await register(bound.port);
+async function run(): Promise<void> {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const binaryPath = join(here, 'forge-go');
+  let child: ChildProcess;
+  let port: number;
+  try {
+    ({ child, port } = await spawnForge(binaryPath));
+  } catch (err) {
+    // Direct spawn failed (most likely EACCES: the binary lost its exec bit
+    // on the way through the GitHub Contents API). Copy it to the temp dir,
+    // make it executable, and spawn the copy.
+    const isAccess =
+      err instanceof Error && ((err as NodeJS.ErrnoException).code === 'EACCES' || err.message.includes('EACCES'));
+    if (!isAccess) throw err;
+    process.stderr.write('[entry] direct spawn failed (EACCES); copying binary to tmpdir\n');
+    const dir = await mkdtemp(join(tmpdir(), 'forge-'));
+    const copyPath = join(dir, 'forge-go');
+    await copyFile(binaryPath, copyPath);
+    await chmod(copyPath, 0o755);
+    ({ child, port } = await spawnForge(copyPath));
+  }
+  process.stdout.write(`[entry] listening on port ${port}\n`);
+
+  await register(port);
   process.stdout.write('[entry] registered; waiting for the env to say done\n');
 
   await waitUntilDone();
-  server.close();
+  child.kill('SIGTERM');
   process.stdout.write('[entry] done\n');
 }
 
